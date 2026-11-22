@@ -1218,3 +1218,46 @@ class TestRouterRewriteTruncationMessageIsHonest:
             "the output length limit — the honest-message fix must not blank "
             "out the accurate case (#91717 scenario 1)."
         )
+
+
+# ── Held-back text chunk swallowed the first tool_call delta (#158731) ──
+
+class TestHeldBackChunkKeepsToolCalls:
+    """A chunk can carry both the tail of the text and the first tool_call delta.
+
+    When the text half is routed into the SSE-echo hold-back, that branch used to ``continue``,
+    dropping the tool call entirely. The call was then assembled from argument-only deltas with
+    an empty name, and the turn failed with ``Unknown tool ''`` after three retries.
+    """
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_first_tool_call_delta_in_a_held_back_chunk_survives(
+        self, _mock_close, mock_create, monkeypatch,
+    ):
+        def _stream():
+            # ':' then ' uniform' engage the SSE-echo guard, so the following chunk's text is held.
+            yield _make_stream_chunk(content=":")
+            yield _make_stream_chunk(content=" uniform")
+            # One chunk: text tail AND the first tool_call delta (the one with id + name).
+            yield _make_stream_chunk(
+                content=".",
+                tool_calls=[_make_tool_call_delta(0, tc_id="call_1", name="read_file", arguments="")],
+            )
+            yield _make_stream_chunk(
+                tool_calls=[_make_tool_call_delta(0, arguments='{"path": "a.txt"}')],
+            )
+            yield _make_stream_chunk(finish_reason="tool_calls")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stream()
+        mock_create.return_value = mock_client
+
+        agent = _make_agent()
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        response = agent._interruptible_streaming_api_call({})
+
+        calls = response.choices[0].message.tool_calls
+        assert calls, "the tool call was dropped"
+        assert calls[0].function.name == "read_file"
+        assert calls[0].function.arguments == '{"path": "a.txt"}'

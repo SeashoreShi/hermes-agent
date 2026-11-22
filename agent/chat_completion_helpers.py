@@ -3103,6 +3103,7 @@ class _StreamingCall(StreamingWaitMonitor):
             # Text (list-of-blocks deltas flattened once); possible echoed SSE is
             # buffered until it can be judged.
             delta_content = flatten_message_text(getattr(delta, "content", None), sep="")
+            delta_tool_calls = getattr(delta, "tool_calls", None)
             if delta_content:
                 content_parts.append(delta_content)
                 if content_watch.feed(delta_content):
@@ -3118,11 +3119,16 @@ class _StreamingCall(StreamingWaitMonitor):
                     pending = "".join(pending_text_parts)
                     if not (_provider_stream_text_may_be_sse(pending) or router_timeout_shim_may_follow(pending)):
                         _flush_pending_stream_text()
-                    continue
+                    # One chunk can carry both the end of the text and the first tool_call delta —
+                    # the one holding `id` and `function.name`. Continuing here dropped those calls,
+                    # which were then assembled from argument-only deltas with an empty name and
+                    # failed the turn with "Unknown tool ''" (#158731). Fall through when this
+                    # chunk also has tool calls.
+                    if not delta_tool_calls:
+                        continue
                 else:
                     self._emit_text(delta_content)
 
-            delta_tool_calls = getattr(delta, "tool_calls", None)
             if delta_tool_calls:
                 _flush_pending_stream_text()
                 for tc_delta in delta_tool_calls:
